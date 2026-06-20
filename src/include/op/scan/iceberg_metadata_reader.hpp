@@ -70,9 +70,9 @@ struct IcebergDeleteData {
   /// Stored on CPU (tiny metadata).
   std::unordered_map<std::string, std::vector<int64_t>> positional_deletes;
 
-  /// V2 equality-delete groups (one per unique key-column schema).
+  /// V2 equality-delete groups materialized per GPU device id.
   /// Supports heterogeneous delete files (e.g., delete by "name" vs "name+bir").
-  std::vector<EqualityDeleteGroup> equality_delete_groups;
+  std::unordered_map<int, std::vector<EqualityDeleteGroup>> equality_delete_groups_by_device;
 
   /// Per-data-file sequence numbers (for equality delete seq filtering).
   /// Key: data_file_path, Value: sequence number from manifest entry.
@@ -81,8 +81,21 @@ struct IcebergDeleteData {
   /// True if there are no deletes to apply (V1 table or empty manifests).
   [[nodiscard]] bool empty() const
   {
-    return positional_deletes.empty() && equality_delete_groups.empty();
+    return positional_deletes.empty() && !has_equality_delete_groups();
   }
+
+  [[nodiscard]] bool has_equality_delete_groups() const;
+
+  [[nodiscard]] std::vector<EqualityDeleteGroup> const& equality_delete_groups_for_device(
+    int device_id) const;
+
+  [[nodiscard]] std::vector<EqualityDeleteGroup> const& equality_delete_groups_for_planning()
+    const;
+};
+
+struct IcebergMetadataStream {
+  int device_id;
+  rmm::cuda_stream_view stream;
 };
 
 /**
@@ -101,13 +114,12 @@ struct IcebergDeleteData {
  * @param context        DuckDB client context for running iceberg_snapshots()
  *                       and reading positional-delete parquet files.
  * @param table_path     The Iceberg table path passed to iceberg_scan().
- * @param metadata_ioctx Single-GPU sirius_ioctx for routing parquet reads
- *                       (V2 equality-delete files + footer extraction). Per
- *                       A single GPU's ioctx is sufficient — these are
- *                       planning-time reads, not on the multi-GPU column-
- *                       chunk hot path. Multi-GPU residency for iceberg
- *                       metadata is deferred. The caller MUST provide a
- *                       non-null ioctx; nullptr throws.
+ * @param metadata_ioctx sirius_ioctx for routing parquet reads
+ *                       (V2 equality-delete files + footer extraction). The
+ *                       caller MUST provide a non-null ioctx; nullptr throws.
+ * @param streams        One Sirius-owned metadata stream per configured GPU.
+ *                       Equality-delete GPU state is materialized once per
+ *                       device id using the corresponding stream.
  * @param snapshot_id    Optional Iceberg snapshot id (latest if omitted).
  * @return Shared pointer to immutable delete data.
  */
@@ -115,7 +127,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,
   std::string const& table_path,
   std::shared_ptr<sirius::io::sirius_ioctx> metadata_ioctx,
-  rmm::cuda_stream_view stream,
+  std::vector<IcebergMetadataStream> const& streams,
   std::optional<uint64_t> snapshot_id = std::nullopt);
 
 /**

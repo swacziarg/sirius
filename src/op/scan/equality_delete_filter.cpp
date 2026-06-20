@@ -17,10 +17,15 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <log/logging.hpp>
 #include <op/scan/iceberg_delete_filter.hpp>
 #include <op/scan/iceberg_equality_delete_mask.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
+
+#include <stdexcept>
+#include <string>
 
 namespace sirius::op::scan {
 
@@ -44,7 +49,15 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
   // Sequence number filtering: per Iceberg spec, equality deletes only apply
   // to data files whose sequence number is strictly LOWER than the delete's.
   // Each group has exactly one sequence number (grouped by schema + seq).
-  auto const& group = _delete_data->equality_delete_groups[_group_index];
+  int current_device = 0;
+  auto status        = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string("[equality_delete_filter] cudaGetDevice failed: ") +
+                             cudaGetErrorString(status));
+  }
+
+  auto const& groups = _delete_data->equality_delete_groups_for_device(current_device);
+  auto const& group  = groups.at(_group_index);
   auto seq_it       = _delete_data->data_file_sequence_numbers.find(data_file_path);
   if (group.sequence_number > 0 && seq_it != _delete_data->data_file_sequence_numbers.end() &&
       seq_it->second > 0 && seq_it->second >= group.sequence_number) {

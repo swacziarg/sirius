@@ -40,6 +40,8 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/utilities/span.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <rmm/cuda_device.hpp>
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -50,6 +52,7 @@
 #include <exception>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace sirius::scan_manager {
@@ -311,13 +314,7 @@ void sirius_scan_manager::start_metadata_processing()
       // run() is fire-and-forget: it enqueues workers and returns immediately.
       // Worker exceptions ride on connector.close(exception_ptr) and surface
       // when the consumer drains via get_next_split().
-      // Metadata pruning uses a planning stream on the first configured GPU.
-      // This does not determine emitted split placement; scan materialization
-      // still runs on executor-selected task streams.
-      split_provider::metadata_stream_provider stream_provider = [this] {
-        return acquire_metadata_stream();
-      };
-      it->second->run(*_dispatcher, *connector, stream_provider);
+      it->second->run(*_dispatcher, *connector);
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed to start: {}", e.what());
       // Synchronous failure inside run() (e.g. scheduler.enqueue throwing)
@@ -328,15 +325,24 @@ void sirius_scan_manager::start_metadata_processing()
   }
 }
 
-split_provider::metadata_stream sirius_scan_manager::acquire_metadata_stream()
+sirius_scan_manager::metadata_stream sirius_scan_manager::acquire_metadata_stream() const
 {
   if (!_metadata_stream_pool || !_metadata_stream_device_id) {
-    throw std::runtime_error(
-      "[sirius_scan_manager] metadata stream pool is not initialized; no configured GPU");
+    int current_device = 0;
+    auto status        = cudaGetDevice(&current_device);
+    if (status != cudaSuccess) {
+      throw std::runtime_error(
+        std::string("[sirius_scan_manager] cudaGetDevice failed while initializing metadata "
+                    "stream pool: ") +
+        cudaGetErrorString(status));
+    }
+    _metadata_stream_device_id = current_device;
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{current_device}};
+    _metadata_stream_pool = std::make_unique<cucascade::memory::exclusive_stream_pool>(
+      rmm::cuda_device_id{current_device}, _config.thread_pool.num_threads);
   }
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{*_metadata_stream_device_id}};
-  return split_provider::metadata_stream{_metadata_stream_pool->acquire_stream(),
-                                         *_metadata_stream_device_id};
+  return metadata_stream{_metadata_stream_pool->acquire_stream(), *_metadata_stream_device_id};
 }
 
 void sirius_scan_manager::reset()

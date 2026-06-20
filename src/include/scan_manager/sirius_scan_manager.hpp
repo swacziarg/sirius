@@ -207,6 +207,11 @@ struct parquet_bind_result {
  */
 class sirius_scan_manager {
  public:
+  struct metadata_stream {
+    cucascade::memory::borrowed_stream stream;
+    int device_id;
+  };
+
   /**
    * @brief Construct a new scan manager.
    *
@@ -370,12 +375,12 @@ class sirius_scan_manager {
   ///         footer fetch / schema inference fails.
   [[nodiscard]] parquet_bind_result describe_parquet(std::string const& uri);
 
+  /// \brief Borrow a stream for planning-time scan metadata work.
+  [[nodiscard]] metadata_stream acquire_metadata_stream() const;
+
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
-
-  /// \brief Borrow a stream for planning-time scan metadata work.
-  [[nodiscard]] split_provider::metadata_stream acquire_metadata_stream();
 
   scan_manager_config _config;
   exec::static_thread_pool _thread_pool;
@@ -390,8 +395,8 @@ class sirius_scan_manager {
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
-  std::optional<int> _metadata_stream_device_id;
-  std::unique_ptr<cucascade::memory::exclusive_stream_pool> _metadata_stream_pool;
+  mutable std::optional<int> _metadata_stream_device_id;
+  mutable std::unique_ptr<cucascade::memory::exclusive_stream_pool> _metadata_stream_pool;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
   /// Produces the right gpu_ingestible per scan source during
   /// prepare_for_query. Holds a borrowed reference to @c _pinned_entries

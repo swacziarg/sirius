@@ -347,12 +347,6 @@ void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& p
     iceberg_delete_data_cache_.emplace(table_path, std::make_shared<op::scan::IcebergDeleteData>());
     return;
   }
-  auto const* metadata_space =
-    *std::min_element(gpu_spaces.begin(), gpu_spaces.end(), [](auto const* lhs, auto const* rhs) {
-      return lhs->get_device_id() < rhs->get_device_id();
-    });
-  auto const metadata_device_id = metadata_space->get_device_id();
-
   auto& scan_mgr  = sirius_ctx->get_scan_manager();
   auto datasource = scan_mgr.create_datasource(table_path);
   if (!datasource) {
@@ -360,15 +354,36 @@ void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& p
       "[sirius_engine] read_iceberg_delete_data: no IO backend supports path: " + table_path);
   }
 
-  // Planning-time equality-delete metadata GPU work uses one stream on the
-  // first configured GPU. Per-task scan execution still runs on the executor-
-  // selected task streams and may place materialization on other GPUs.
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{metadata_device_id}};
-  cucascade::memory::exclusive_stream_pool stream_pool(rmm::cuda_device_id{metadata_device_id}, 1);
-  auto stream = stream_pool.acquire_stream();
-  auto data   = op::scan::read_iceberg_delete_data(
-    context, table_path, datasource->io_ctx(), stream.get(), snapshot_id);
-  stream->synchronize();
+  std::vector<cucascade::memory::borrowed_stream> borrowed_streams;
+  std::vector<std::unique_ptr<cucascade::memory::exclusive_stream_pool>> stream_pools;
+  std::vector<op::scan::IcebergMetadataStream> metadata_streams;
+  borrowed_streams.reserve(gpu_spaces.size());
+  stream_pools.reserve(gpu_spaces.size());
+  metadata_streams.reserve(gpu_spaces.size());
+
+  auto sorted_gpu_spaces = gpu_spaces;
+  std::sort(sorted_gpu_spaces.begin(), sorted_gpu_spaces.end(), [](auto const* lhs,
+                                                                   auto const* rhs) {
+    return lhs->get_device_id() < rhs->get_device_id();
+  });
+
+  for (auto const* gpu_space : sorted_gpu_spaces) {
+    auto const device_id = gpu_space->get_device_id();
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
+    auto pool =
+      std::make_unique<cucascade::memory::exclusive_stream_pool>(rmm::cuda_device_id{device_id}, 1);
+    borrowed_streams.push_back(pool->acquire_stream());
+    metadata_streams.push_back(
+      op::scan::IcebergMetadataStream{device_id, borrowed_streams.back().get()});
+    stream_pools.push_back(std::move(pool));
+  }
+
+  auto data =
+    op::scan::read_iceberg_delete_data(
+      context, table_path, datasource->io_ctx(), metadata_streams, snapshot_id);
+  for (auto& stream : borrowed_streams) {
+    stream->synchronize();
+  }
   iceberg_delete_data_cache_.emplace(table_path, std::move(data));
 }
 

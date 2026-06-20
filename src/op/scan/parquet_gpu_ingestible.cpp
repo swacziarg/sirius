@@ -35,8 +35,9 @@
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/table/table.hpp>
-#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/cuda_device.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
@@ -74,6 +75,22 @@ struct rg_accumulator {
 };
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
+
+struct metadata_stream_sync_guard {
+  scan_manager::sirius_scan_manager::metadata_stream& metadata_stream;
+  bool armed{true};
+
+  ~metadata_stream_sync_guard()
+  {
+    if (!armed) { return; }
+    try {
+      metadata_stream.stream->synchronize();
+    } catch (...) {
+    }
+  }
+
+  void release() { armed = false; }
+};
 
 // Case-insensitively strip a leading "file://" so explicit local URIs behave
 // exactly like bare paths (mirrors the scan_manager's normalize_path): the
@@ -170,14 +187,14 @@ bool parquet_gpu_ingestible::has_more_splits() const
   return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
 }
 
-std::function<std::vector<std::unique_ptr<op::operator_data>>(rmm::cuda_stream_view)>
+std::function<std::vector<std::unique_ptr<op::operator_data>>()>
 parquet_gpu_ingestible::next_split_provider()
 {
   auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
   if (batch_idx >= _batches.size()) { return nullptr; }
-  return [this, batch_idx](rmm::cuda_stream_view stream) {
+  return [this, batch_idx]() {
     std::vector<std::unique_ptr<op::operator_data>> out;
-    run_batch(_batches[batch_idx], out, stream);
+    run_batch(_batches[batch_idx], out);
     return out;
   };
 }
@@ -186,18 +203,22 @@ parquet_gpu_ingestible::next_split_provider()
 // run_batch — ports parquet_split_provider::run_batch
 //===----------------------------------------------------------------------===//
 void parquet_gpu_ingestible::run_batch(file_batch const& batch,
-                                       std::vector<std::unique_ptr<op::operator_data>>& out,
-                                       rmm::cuda_stream_view stream)
+                                       std::vector<std::unique_ptr<op::operator_data>>& out)
 {
+  if (_scan_manager == nullptr) {
+    throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired.");
+  }
+
+  auto metadata_stream = _scan_manager->acquire_metadata_stream();
+  metadata_stream_sync_guard sync_guard{metadata_stream};
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{metadata_stream.device_id}};
+  auto stream = metadata_stream.stream.get();
+
   auto const data_column_names = _plan->data_column_names();
   auto reader_options          = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());
 
   if (_plan->is_projected()) { reader_options->set_column_names(data_column_names); }
-
-  if (_scan_manager == nullptr) {
-    throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired.");
-  }
 
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
   bool skip_pushdown_due_to_flba                                                 = false;
@@ -521,6 +542,8 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     seal_current_file();
   }
   flush(reader_options, _plan);
+  metadata_stream.stream->synchronize();
+  sync_guard.release();
 }
 
 //===----------------------------------------------------------------------===//

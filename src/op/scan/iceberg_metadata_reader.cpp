@@ -25,6 +25,8 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <duckdb/main/connection.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_avro_reader.hpp>
@@ -39,6 +41,34 @@
 #include <vector>
 
 namespace sirius::op::scan {
+
+bool IcebergDeleteData::has_equality_delete_groups() const
+{
+  return std::any_of(equality_delete_groups_by_device.begin(),
+                     equality_delete_groups_by_device.end(),
+                     [](auto const& entry) { return !entry.second.empty(); });
+}
+
+std::vector<EqualityDeleteGroup> const& IcebergDeleteData::equality_delete_groups_for_device(
+  int device_id) const
+{
+  auto it = equality_delete_groups_by_device.find(device_id);
+  if (it == equality_delete_groups_by_device.end()) {
+    throw std::runtime_error("[iceberg] equality-delete GPU state is not materialized for device " +
+                             std::to_string(device_id));
+  }
+  return it->second;
+}
+
+std::vector<EqualityDeleteGroup> const& IcebergDeleteData::equality_delete_groups_for_planning()
+  const
+{
+  static const std::vector<EqualityDeleteGroup> empty_groups;
+  for (auto const& [_, groups] : equality_delete_groups_by_device) {
+    if (!groups.empty()) { return groups; }
+  }
+  return empty_groups;
+}
 
 namespace {
 
@@ -364,7 +394,7 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 /// so the scan-time check is a simple CPU comparison (no extra GPU work).
 void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_entries,
                                   sirius::io::sirius_ioctx& ioctx,
-                                  IcebergDeleteData& data,
+                                  std::vector<EqualityDeleteGroup>& equality_delete_groups,
                                   rmm::cuda_stream_view stream)
 {
   if (eq_entries.empty()) return;
@@ -411,11 +441,11 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
     auto group =
       build_equality_group(std::move(g.key_names), std::move(g.key_field_ids), g.views, stream);
     group.sequence_number = g.sequence_number;
-    data.equality_delete_groups.push_back(std::move(group));
+    equality_delete_groups.push_back(std::move(group));
   }
 
   SIRIUS_LOG_INFO("[iceberg] Built {} equality-delete group(s).",
-                  data.equality_delete_groups.size());
+                  equality_delete_groups.size());
 }
 
 }  // anonymous namespace
@@ -428,7 +458,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,
   std::string const& table_path,
   std::shared_ptr<sirius::io::sirius_ioctx> metadata_ioctx,
-  rmm::cuda_stream_view stream,
+  std::vector<IcebergMetadataStream> const& streams,
   std::optional<uint64_t> snapshot_id)
 {
   auto data = std::make_shared<IcebergDeleteData>();
@@ -456,9 +486,18 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
       materialize_positional_deletes(*context.db, discovery, data->positional_deletes);
     }
     if (has_eq_deletes) {
+      if (streams.empty()) {
+        throw std::runtime_error(
+          "[iceberg] equality deletes require at least one configured GPU metadata stream");
+      }
       data->data_file_sequence_numbers = std::move(discovery.data_file_sequence_numbers);
-      materialize_equality_deletes(
-        discovery.equality_delete_entries, *metadata_ioctx, *data, stream);
+      for (auto const& metadata_stream : streams) {
+        rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{metadata_stream.device_id}};
+        auto& groups = data->equality_delete_groups_by_device[metadata_stream.device_id];
+        materialize_equality_deletes(
+          discovery.equality_delete_entries, *metadata_ioctx, groups, metadata_stream.stream);
+        metadata_stream.stream.synchronize();
+      }
     }
 
   } catch (std::exception const& e) {

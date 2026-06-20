@@ -74,14 +74,14 @@ iceberg_scan_task_global_state::init_data iceberg_scan_task_global_state::prepar
   // those columns to probe the equality-delete hash joins.
   // Extra columns are stripped after delete filtering by the pipeline.
   size_t extra_cols = 0;
-  if (scan_op->delete_data && !scan_op->delete_data->equality_delete_groups.empty()) {
+  if (scan_op->delete_data && scan_op->delete_data->has_equality_delete_groups()) {
     // Build name→index map for O(1) lookups instead of linear scan.
     std::unordered_map<std::string, size_t> name_to_idx;
     for (size_t i = 0; i < scan_op->names.size(); ++i) {
       name_to_idx.emplace(scan_op->names[i], i);
     }
     std::unordered_set<size_t> already_selected(selected.begin(), selected.end());
-    for (auto const& group : scan_op->delete_data->equality_delete_groups) {
+    for (auto const& group : scan_op->delete_data->equality_delete_groups_for_planning()) {
       for (auto const& key_name : group.key_names) {
         auto it = name_to_idx.find(key_name);
         if (it != name_to_idx.end() &&
@@ -178,7 +178,7 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
   // Falls back to name matching when field IDs are unavailable.
   // One filter per group supports heterogeneous delete schemas.
   // -----------------------------------------------------------------------
-  if (!dd->equality_delete_groups.empty()) {
+  if (dd->has_equality_delete_groups()) {
     auto const& selected = get_selected_column_indices();
 
     // Build a field-ID map for the first data file for equality-delete
@@ -194,8 +194,9 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
       }
     }
 
-    for (size_t gi = 0; gi < dd->equality_delete_groups.size(); ++gi) {
-      auto const& group = dd->equality_delete_groups[gi];
+    auto const& equality_delete_groups = dd->equality_delete_groups_for_planning();
+    for (size_t gi = 0; gi < equality_delete_groups.size(); ++gi) {
+      auto const& group = equality_delete_groups[gi];
 
       std::vector<cudf::size_type> data_key_indices;
       bool all_found = true;

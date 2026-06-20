@@ -45,6 +45,9 @@ namespace sirius::io {
 
 class gpu_ingestible;
 
+using split_work_callback =
+  std::function<std::vector<std::unique_ptr<op::operator_data>>(rmm::cuda_stream_view)>;
+
 //===----------------------------------------------------------------------===//
 // ingestible_table_info
 //===----------------------------------------------------------------------===//
@@ -252,8 +255,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * null callable indicates no work was claimed (the driver loop skips
    * empty handoffs).
    */
-  virtual std::function<std::vector<std::unique_ptr<op::operator_data>>()>
-  next_split_provider() = 0;
+  virtual split_work_callback next_split_provider() = 0;
 
   /**
    * @brief Materialize the cudf table for one split. Called by

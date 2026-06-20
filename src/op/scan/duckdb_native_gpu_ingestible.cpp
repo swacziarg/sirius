@@ -175,8 +175,7 @@ bool duckdb_native_gpu_ingestible::has_more_splits() const
   return _next_range_idx.load(std::memory_order_relaxed) < _num_ranges;
 }
 
-std::function<std::vector<std::unique_ptr<op::operator_data>>()>
-duckdb_native_gpu_ingestible::next_split_provider()
+io::split_work_callback duckdb_native_gpu_ingestible::next_split_provider()
 {
   auto const idx = _next_range_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _num_ranges) { return {}; }
@@ -186,7 +185,8 @@ duckdb_native_gpu_ingestible::next_split_provider()
 
   // Runs on a worker thread: walk this range and emit one raw range carrier for
   // the consumer to coalesce. Reads the read-only _plan.
-  return [this, rg_begin, rg_end]() -> std::vector<std::unique_ptr<op::operator_data>> {
+  return [this, rg_begin, rg_end](
+           rmm::cuda_stream_view /*stream*/) -> std::vector<std::unique_ptr<op::operator_data>> {
     auto range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
     if (!range.viable) {
       // Surfaced to the consumer through the connector; rejects the query.

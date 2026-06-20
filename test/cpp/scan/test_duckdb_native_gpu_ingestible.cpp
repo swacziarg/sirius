@@ -18,7 +18,11 @@
 // consumer-side coalescing of ranges into cap-sized batches (including the
 // single-split tail case).
 
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
+
 #include <catch.hpp>
+#include <cucascade/memory/stream_pool.hpp>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
@@ -131,10 +135,11 @@ struct drained {
 drained drain_ranges(duckdb_native_gpu_ingestible& ingestible)
 {
   drained out;
+  rmm::cuda_stream stream;
   while (ingestible.has_more_splits()) {
     auto factory = ingestible.next_split_provider();
     if (!factory) break;
-    auto carriers = factory();
+    auto carriers = factory(stream.view());
     if (carriers.empty()) break;
     ++out.range_count;
     for (auto& c : carriers) {
@@ -157,7 +162,10 @@ std::vector<std::unique_ptr<op::operator_data>> run_and_consume(
   split_connector connector;
   split_provider provider{ingestible};
   inline_scheduler sched;
-  provider.run(sched, connector);  // pushes all carriers; closes connector on return
+  cucascade::memory::exclusive_stream_pool stream_pool(rmm::cuda_device_id{}, 1);
+  provider.run(sched, connector, [&stream_pool] {
+    return split_provider::metadata_stream{stream_pool.acquire_stream(), 0};
+  });  // pushes all carriers; closes connector on return
 
   std::vector<std::unique_ptr<op::operator_data>> batches;
   for (;;) {
@@ -310,7 +318,8 @@ TEST_CASE("duckdb_native_gpu_ingestible emits one range for a small INTEGER tabl
 
   auto factory = ingestible.next_split_provider();
   REQUIRE(factory);
-  auto carriers = factory();
+  rmm::cuda_stream stream;
+  auto carriers = factory(stream.view());
   REQUIRE(carriers.size() == 1);
 
   auto* range = dynamic_cast<duckdb_native_range_input*>(carriers[0].get());

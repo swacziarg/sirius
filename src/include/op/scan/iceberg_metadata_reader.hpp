@@ -22,6 +22,8 @@
 #include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <duckdb/main/client_context.hpp>
 #include <op/scan/iceberg_avro_reader.hpp>
 
@@ -113,6 +115,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,
   std::string const& table_path,
   std::shared_ptr<sirius::io::sirius_ioctx> metadata_ioctx,
+  rmm::cuda_stream_view stream,
   std::optional<uint64_t> snapshot_id = std::nullopt);
 
 /**

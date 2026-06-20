@@ -26,6 +26,8 @@
 #include "scan_manager/gpu_ingestible_factory.hpp"
 #include "scan_manager/split_provider.hpp"
 
+#include <cucascade/memory/stream_pool.hpp>
+
 // Forward-declare sirius_ioctx via <io/types.hpp> for the owned-backend
 // vector used by create_datasource / create_ingestible_for.
 #include <cudf/column/column.hpp>
@@ -372,6 +374,9 @@ class sirius_scan_manager {
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
+  /// \brief Borrow a stream for planning-time scan metadata work.
+  [[nodiscard]] split_provider::metadata_stream acquire_metadata_stream();
+
   scan_manager_config _config;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
@@ -385,6 +390,8 @@ class sirius_scan_manager {
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
+  std::optional<int> _metadata_stream_device_id;
+  std::unique_ptr<cucascade::memory::exclusive_stream_pool> _metadata_stream_pool;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
   /// Produces the right gpu_ingestible per scan source during
   /// prepare_for_query. Holds a borrowed reference to @c _pinned_entries

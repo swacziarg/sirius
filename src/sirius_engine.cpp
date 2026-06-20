@@ -54,9 +54,12 @@
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
 
+#include <rmm/cuda_device.hpp>
+
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/memory/stream_pool.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -336,14 +339,36 @@ void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& p
 
   duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
 
+  auto const gpu_spaces =
+    sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (gpu_spaces.empty()) {
+    SIRIUS_LOG_WARN("[sirius_engine] No configured GPU for iceberg '{}'; treating as V1.",
+                    table_path);
+    iceberg_delete_data_cache_.emplace(table_path, std::make_shared<op::scan::IcebergDeleteData>());
+    return;
+  }
+  auto const* metadata_space =
+    *std::min_element(gpu_spaces.begin(), gpu_spaces.end(), [](auto const* lhs, auto const* rhs) {
+      return lhs->get_device_id() < rhs->get_device_id();
+    });
+  auto const metadata_device_id = metadata_space->get_device_id();
+
   auto& scan_mgr  = sirius_ctx->get_scan_manager();
   auto datasource = scan_mgr.create_datasource(table_path);
   if (!datasource) {
     throw std::runtime_error(
       "[sirius_engine] read_iceberg_delete_data: no IO backend supports path: " + table_path);
   }
-  auto data =
-    op::scan::read_iceberg_delete_data(context, table_path, datasource->io_ctx(), snapshot_id);
+
+  // Planning-time equality-delete metadata GPU work uses one stream on the
+  // first configured GPU. Per-task scan execution still runs on the executor-
+  // selected task streams and may place materialization on other GPUs.
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{metadata_device_id}};
+  cucascade::memory::exclusive_stream_pool stream_pool(rmm::cuda_device_id{metadata_device_id}, 1);
+  auto stream = stream_pool.acquire_stream();
+  auto data   = op::scan::read_iceberg_delete_data(
+    context, table_path, datasource->io_ctx(), stream.get(), snapshot_id);
+  stream->synchronize();
   iceberg_delete_data_cache_.emplace(table_path, std::move(data));
 }
 

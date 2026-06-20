@@ -189,10 +189,11 @@ std::vector<std::unique_ptr<sirius::op::operator_data>> drain_ingestible(
   sscan::parquet_gpu_ingestible& ingestible)
 {
   std::vector<std::unique_ptr<sirius::op::operator_data>> splits;
+  rmm::cuda_stream stream;
   while (ingestible.has_more_splits()) {
     auto work = ingestible.next_split_provider();
     if (!work) { continue; }
-    auto batch = work();
+    auto batch = work(stream.view());
     for (auto& s : batch) {
       splits.push_back(std::move(s));
     }

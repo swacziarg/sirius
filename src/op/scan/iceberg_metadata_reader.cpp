@@ -24,7 +24,6 @@
 #include <cudf/io/parquet_metadata.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/default_stream.hpp>
 
 #include <duckdb/main/connection.hpp>
 #include <log/logging.hpp>
@@ -216,10 +215,9 @@ struct equality_delete_read_result {
  * is enforced by sirius_config::enforce_sirius_datasource_for_multi_gpu()).
  */
 equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path,
-                                                      sirius::io::sirius_ioctx& ioctx)
+                                                      sirius::io::sirius_ioctx& ioctx,
+                                                      rmm::cuda_stream_view stream)
 {
-  auto stream = cudf::get_default_stream();
-
   // Both the read_parquet (table data) AND the read_parquet_footers (field-id
   // extraction) share the same uring_io_object + sirius_datasource — the
   // io_object opens 2 fds (O_RDONLY + O_RDONLY|O_DIRECT) so reusing avoids
@@ -323,10 +321,9 @@ void materialize_positional_deletes(duckdb::DatabaseInstance& db,
 /// Build one EqualityDeleteGroup from a set of tables sharing the same schema.
 EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
                                          std::vector<std::optional<int32_t>> key_field_ids,
-                                         std::vector<cudf::table_view> const& views)
+                                         std::vector<cudf::table_view> const& views,
+                                         rmm::cuda_stream_view stream)
 {
-  auto stream = cudf::get_default_stream();
-
   auto all_rows = (views.size() == 1) ? std::make_unique<cudf::table>(views[0], stream)
                                       : cudf::concatenate(views, stream);
 
@@ -367,7 +364,8 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 /// so the scan-time check is a simple CPU comparison (no extra GPU work).
 void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_entries,
                                   sirius::io::sirius_ioctx& ioctx,
-                                  IcebergDeleteData& data)
+                                  IcebergDeleteData& data,
+                                  rmm::cuda_stream_view stream)
 {
   if (eq_entries.empty()) return;
 
@@ -387,7 +385,7 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
     SIRIUS_LOG_DEBUG("[iceberg] Reading equality-delete file: {} (seq={})",
                      eq_entry.file_path,
                      eq_entry.sequence_number);
-    auto read_result = read_equality_delete_file(eq_entry.file_path, ioctx);
+    auto read_result = read_equality_delete_file(eq_entry.file_path, ioctx, stream);
 
     // Find existing group with same column names AND same sequence number.
     FileGroup* target = nullptr;
@@ -410,7 +408,8 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
   // Build one EqualityDeleteGroup per (schema, sequence_number).
   for (auto& g : groups) {
     if (g.views.empty()) continue;
-    auto group = build_equality_group(std::move(g.key_names), std::move(g.key_field_ids), g.views);
+    auto group =
+      build_equality_group(std::move(g.key_names), std::move(g.key_field_ids), g.views, stream);
     group.sequence_number = g.sequence_number;
     data.equality_delete_groups.push_back(std::move(group));
   }
@@ -429,6 +428,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,
   std::string const& table_path,
   std::shared_ptr<sirius::io::sirius_ioctx> metadata_ioctx,
+  rmm::cuda_stream_view stream,
   std::optional<uint64_t> snapshot_id)
 {
   auto data = std::make_shared<IcebergDeleteData>();
@@ -457,7 +457,8 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
     }
     if (has_eq_deletes) {
       data->data_file_sequence_numbers = std::move(discovery.data_file_sequence_numbers);
-      materialize_equality_deletes(discovery.equality_delete_entries, *metadata_ioctx, *data);
+      materialize_equality_deletes(
+        discovery.equality_delete_entries, *metadata_ioctx, *data, stream);
     }
 
   } catch (std::exception const& e) {

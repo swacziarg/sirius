@@ -170,14 +170,13 @@ bool parquet_gpu_ingestible::has_more_splits() const
   return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
 }
 
-std::function<std::vector<std::unique_ptr<op::operator_data>>()>
-parquet_gpu_ingestible::next_split_provider()
+io::split_work_callback parquet_gpu_ingestible::next_split_provider()
 {
   auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
   if (batch_idx >= _batches.size()) { return nullptr; }
-  return [this, batch_idx]() {
+  return [this, batch_idx](rmm::cuda_stream_view stream) {
     std::vector<std::unique_ptr<op::operator_data>> out;
-    run_batch(_batches[batch_idx], out);
+    run_batch(_batches[batch_idx], out, stream);
     return out;
   };
 }
@@ -186,10 +185,9 @@ parquet_gpu_ingestible::next_split_provider()
 // run_batch — ports parquet_split_provider::run_batch
 //===----------------------------------------------------------------------===//
 void parquet_gpu_ingestible::run_batch(file_batch const& batch,
-                                       std::vector<std::unique_ptr<op::operator_data>>& out)
+                                       std::vector<std::unique_ptr<op::operator_data>>& out,
+                                       rmm::cuda_stream_view stream)
 {
-  auto stream = cudf::get_default_stream();
-
   auto const data_column_names = _plan->data_column_names();
   auto reader_options          = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());

@@ -49,10 +49,7 @@ struct tagged_split : public op::operator_data {
 struct test_pusher : public split_provider {
   using split_provider::push_to_connector;
   [[nodiscard]] bool has_more_splits() const override { return false; }
-  std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override
-  {
-    return nullptr;
-  }
+  sirius::io::split_work_callback next_split_provider() override { return nullptr; }
 };
 
 }  // namespace

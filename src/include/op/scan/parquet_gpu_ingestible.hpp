@@ -188,7 +188,7 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
   ~parquet_gpu_ingestible() override;
 
   [[nodiscard]] bool has_more_splits() const override;
-  std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
+  io::split_work_callback next_split_provider() override;
 
   io::filtered_table materialize_table(io::scan_info const& info,
                                        ::cucascade::memory::memory_space const& mem_space,
@@ -208,7 +208,9 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
     std::vector<std::string> file_paths;
   };
 
-  void run_batch(file_batch const& batch, std::vector<std::unique_ptr<op::operator_data>>& out);
+  void run_batch(file_batch const& batch,
+                 std::vector<std::unique_ptr<op::operator_data>>& out,
+                 rmm::cuda_stream_view stream);
 
   // Canonical scan plan — built once in the constructor, shared by every
   // emitted split via its parquet_split_info::plan member.

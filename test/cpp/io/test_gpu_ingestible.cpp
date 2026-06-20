@@ -47,11 +47,7 @@ class fake_gpu_ingestible : public sirius::io::gpu_ingestible {
   using sirius::io::gpu_ingestible::gpu_ingestible;
 
   [[nodiscard]] bool has_more_splits() const override { return false; }
-  std::function<std::vector<std::unique_ptr<sirius::op::operator_data>>()> next_split_provider()
-    override
-  {
-    return nullptr;
-  }
+  sirius::io::split_work_callback next_split_provider() override { return nullptr; }
   sirius::io::filtered_table materialize_table(sirius::io::scan_info const&,
                                                cucascade::memory::memory_space const&,
                                                rmm::cuda_stream_view) override

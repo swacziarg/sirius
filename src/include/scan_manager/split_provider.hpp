@@ -19,6 +19,10 @@
 #include "io/gpu_ingestible.hpp"
 #include "scan_manager/split_connector.hpp"
 
+#include <rmm/cuda_device.hpp>
+
+#include <cucascade/memory/stream_pool.hpp>
+
 #include <atomic>
 #include <cstddef>
 #include <exception>
@@ -62,6 +66,11 @@ class balancing_strategy;
  */
 class split_provider {
  public:
+  struct metadata_stream {
+    cucascade::memory::borrowed_stream stream;
+    int device_id;
+  };
+
   /// Default ctor — used by legacy subclasses that override both virtuals
   /// (their @c _ingestible stays null). Removed when those subclasses are
   /// deleted.
@@ -93,8 +102,12 @@ class split_provider {
    *                   the callable asynchronously. @c static_thread_pool and
    *                   @c scoped_dispatcher both satisfy this shape.
    */
+  using metadata_stream_provider = std::function<metadata_stream()>;
+
   template <typename Scheduler>
-  void run(Scheduler& scheduler, split_connector& connector);
+  void run(Scheduler& scheduler,
+           split_connector& connector,
+           metadata_stream_provider const& stream_provider);
 
   /**
    * @brief Snapshot check for remaining work. Thread-safe.
@@ -118,7 +131,7 @@ class split_provider {
    * path, but the null fallback keeps the contract simple under concurrent
    * observers.
    */
-  virtual std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider()
+  virtual io::split_work_callback next_split_provider()
   {
     if (!_ingestible) { return nullptr; }
     return _ingestible->next_split_provider();
@@ -228,7 +241,9 @@ class split_provider {
 };
 
 template <typename Scheduler>
-void split_provider::run(Scheduler& scheduler, split_connector& connector)
+void split_provider::run(Scheduler& scheduler,
+                         split_connector& connector,
+                         metadata_stream_provider const& stream_provider)
 {
   auto state = worker_state::create(connector);
   while (has_more_splits()) {
@@ -236,9 +251,12 @@ void split_provider::run(Scheduler& scheduler, split_connector& connector)
     // Concurrent observer could have drained the last batch between the
     // has_more_splits() check and our claim; skip the empty handoff.
     if (!work) { continue; }
-    scheduler.enqueue([this, state, work = std::move(work)]() mutable {
+    scheduler.enqueue([this, state, stream_provider, work = std::move(work)]() mutable {
       try {
-        auto splits = work();
+        auto metadata_stream = stream_provider();
+        rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{metadata_stream.device_id}};
+        auto splits = work(metadata_stream.stream.get());
+        metadata_stream.stream->synchronize();
         for (auto& split : splits) {
           if (split) { apply_balancing(*split); }
           push_to_connector(state->connector, std::move(split));

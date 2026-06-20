@@ -116,8 +116,7 @@ bool pinned_table_gpu_ingestible::has_more_splits() const
   return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
 }
 
-std::function<std::vector<std::unique_ptr<op::operator_data>>()>
-pinned_table_gpu_ingestible::next_split_provider()
+io::split_work_callback pinned_table_gpu_ingestible::next_split_provider()
 {
   auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
   if (batch_idx >= _batches.size()) { return nullptr; }
@@ -126,8 +125,8 @@ pinned_table_gpu_ingestible::next_split_provider()
   bool const apply_assembly       = needs_output_assembly(*_plan);
   bool const need_post_processing = apply_filter || apply_assembly;
 
-  return [this, batch_idx, apply_filter, apply_assembly, need_post_processing]()
-           -> std::vector<std::unique_ptr<op::operator_data>> {
+  return [this, batch_idx, apply_filter, apply_assembly, need_post_processing](
+           rmm::cuda_stream_view /*stream*/) -> std::vector<std::unique_ptr<op::operator_data>> {
     auto batch = produce_batch(batch_idx);
 
     std::unique_ptr<io::post_filter_and_projection_info> filter_info;

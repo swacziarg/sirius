@@ -131,7 +131,8 @@ class split_provider {
    * path, but the null fallback keeps the contract simple under concurrent
    * observers.
    */
-  virtual io::split_work_callback next_split_provider()
+  virtual std::function<std::vector<std::unique_ptr<op::operator_data>>(rmm::cuda_stream_view)>
+  next_split_provider()
   {
     if (!_ingestible) { return nullptr; }
     return _ingestible->next_split_provider();

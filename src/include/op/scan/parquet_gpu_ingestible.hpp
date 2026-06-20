@@ -188,7 +188,8 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
   ~parquet_gpu_ingestible() override;
 
   [[nodiscard]] bool has_more_splits() const override;
-  io::split_work_callback next_split_provider() override;
+  std::function<std::vector<std::unique_ptr<op::operator_data>>(rmm::cuda_stream_view)>
+  next_split_provider() override;
 
   io::filtered_table materialize_table(io::scan_info const& info,
                                        ::cucascade::memory::memory_space const& mem_space,

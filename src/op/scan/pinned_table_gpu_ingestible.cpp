@@ -116,7 +116,8 @@ bool pinned_table_gpu_ingestible::has_more_splits() const
   return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
 }
 
-io::split_work_callback pinned_table_gpu_ingestible::next_split_provider()
+std::function<std::vector<std::unique_ptr<op::operator_data>>(rmm::cuda_stream_view)>
+pinned_table_gpu_ingestible::next_split_provider()
 {
   auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
   if (batch_idx >= _batches.size()) { return nullptr; }

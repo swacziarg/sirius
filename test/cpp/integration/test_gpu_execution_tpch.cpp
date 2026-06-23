@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -34,6 +35,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace fs = std::filesystem;
 
@@ -62,6 +64,27 @@ struct sirius_config_env_guard {
   }
 
   ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
+};
+
+struct temp_duckdb_file {
+  explicit temp_duckdb_file(std::string_view stem)
+    : path(fs::temp_directory_path() /
+           (std::string{stem} + "_" + std::to_string(reinterpret_cast<std::uintptr_t>(this)) +
+            ".duckdb"))
+  {
+    cleanup();
+  }
+
+  ~temp_duckdb_file() { cleanup(); }
+
+  void cleanup() const
+  {
+    std::error_code ec;
+    fs::remove(path, ec);
+    fs::remove(path.string() + ".wal", ec);
+  }
+
+  fs::path path;
 };
 
 class GPUExecutionFixtureBase {
@@ -4514,6 +4537,33 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "[integration][gpu_execution][cpu_source]")
 {
   compare_gpu_vs_cpu("select count(*) from nation;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixtureBase,
+                 "gpu_execution - duckdb-native count(*) empty projection",
+                 "[integration][gpu_execution][duckdb_native][regression]")
+{
+  temp_duckdb_file db_file{"sirius_native_count_star"};
+  std::string const quote(1, 39);
+  auto result = con->Query("ATTACH " + quote + db_file.path.string() + quote + " AS countstar;");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+
+  result = con->Query(
+    "CREATE TABLE countstar.t AS "
+    "SELECT range::INTEGER AS id FROM range(0, 4096);");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+
+  result = con->Query("CHECKPOINT countstar;");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+
+  compare_gpu_vs_cpu("select count(*) from countstar.t;");
+
+  result = con->Query("DETACH countstar;");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,

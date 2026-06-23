@@ -318,9 +318,18 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   auto const& source_ids =
     scan_op.projection_ids.empty() ? source_ids_fallback : scan_op.projection_ids;
 
-  table_info->projected_cols.reserve(source_ids.size());
-  table_info->projected_types.reserve(source_ids.size());
-  for (std::size_t k = 0; k < source_ids.size(); ++k) {
+  bool const use_rowid_carrier = source_ids.empty();
+  auto const projected_count = use_rowid_carrier ? 1 : source_ids.size();
+  table_info->projected_cols.reserve(projected_count);
+  table_info->projected_types.reserve(projected_count);
+  if (use_rowid_carrier) {
+    op::scan::projected_column pc;
+    pc.is_rowid = true;
+    table_info->projected_cols.push_back(pc);
+    table_info->projected_types.push_back(
+      sirius::logical_type::make(sirius::type_id::BIGINT));
+  }
+  for (std::size_t k = 0; !use_rowid_carrier && k < source_ids.size(); ++k) {
     auto pid            = source_ids[k];
     auto const& col_idx = scan_op.column_ids[pid];
     op::scan::projected_column pc;

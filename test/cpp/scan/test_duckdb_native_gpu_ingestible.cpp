@@ -26,6 +26,7 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
+#include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
@@ -40,7 +41,11 @@
 #include <io/types.hpp>
 #include <op/scan/duckdb_block_layout.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
+#include <op/scan/sirius_gpu_scan_operator.hpp>
+#include <op/sirius_physical_table_scan.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <pipeline/sirius_meta_pipeline.hpp>
+#include <pipeline/sirius_pipeline_converter.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <scan_manager/split_connector.hpp>
 #include <scan_manager/split_provider.hpp>
@@ -94,6 +99,19 @@ duckdb::DataTable& get_storage(duckdb::Connection& con, std::string const& table
   auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
+}
+
+duckdb::TableCatalogEntry& get_table_entry(duckdb::Connection& con,
+                                           std::string const& table_name)
+{
+  exec_ok(con, "BEGIN TRANSACTION");
+  auto& ctx     = *con.context;
+  auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
+  duckdb::CatalogTransaction txn(catalog, ctx);
+  auto& schema = catalog.GetSchema(txn, "main");
+  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  REQUIRE(entry);
+  return entry->Cast<duckdb::TableCatalogEntry>();
 }
 
 projected_column real_col(duckdb::idx_t col_id)
@@ -202,6 +220,33 @@ duckdb_native_split_payload const& payload_of(op::operator_data const& batch)
   auto const* split_info = dynamic_cast<duckdb_native_split_info const*>(&input->metadata->scan());
   REQUIRE(split_info != nullptr);
   return split_info->payload;
+}
+
+struct test_sink : op::sirius_physical_operator {
+  test_sink()
+    : sirius_physical_operator(op::SiriusPhysicalOperatorType::RESULT_COLLECTOR,
+                               {sirius::logical_type::make(sirius::type_id::BIGINT)},
+                               0)
+  {
+  }
+
+  bool is_sink() const override { return true; }
+};
+
+sirius::pipeline::pipeline_conversion_result convert_sirius_plan(
+  duckdb::Connection& con, op::sirius_physical_operator& plan)
+{
+  sirius::pipeline::pipeline_build_context build_ctx;
+  sirius::pipeline::sirius_pipeline_build_state state;
+  auto root_pipeline =
+    duckdb::make_shared_ptr<sirius::pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
+  root_pipeline->build(plan);
+  root_pipeline->ready();
+
+  sirius::operator_params op_params;
+  sirius::pipeline::sirius_pipeline_converter converter(
+    build_ctx, op_params, /*iceberg_cache=*/nullptr, con.context.get());
+  return converter.convert(*root_pipeline);
 }
 
 std::string env_or(std::string_view name, std::string fallback = {})
@@ -622,6 +667,51 @@ TEST_CASE("duckdb_native_gpu_ingestible leaves io handles null for an empty db_p
   auto const& payload = payload_of(*batches[0]);
   REQUIRE(payload.io_ctx == nullptr);
   REQUIRE(payload.db_io_object == nullptr);
+}
+
+TEST_CASE("duckdb-native converter gives empty source scan a rowid carrier",
+          "[scan][duckdb_native_gpu_ingestible][planner]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 16)");
+  exec_ok(con, "CHECKPOINT");
+
+  auto& table = get_table_entry(con, "t");
+  auto scan = duckdb::make_uniq<op::sirius_physical_table_scan>(
+    duckdb::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::BIGINT)},
+    duckdb::TableScanFunction::GetFunction(),
+    std::make_unique<duckdb::TableScanBindData>(table),
+    duckdb::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::INTEGER)},
+    /*column_ids=*/duckdb::vector<duckdb::ColumnIndex>{},
+    /*projection_ids=*/duckdb::vector<std::size_t>{},
+    duckdb::vector<std::string>{"a"},
+    /*table_filters=*/nullptr,
+    /*estimated_cardinality=*/0,
+    duckdb::ExtraOperatorInfo{},
+    duckdb::vector<duckdb::Value>{},
+    table.GetVirtualColumns());
+
+  test_sink root;
+  root.children.push_back(std::move(scan));
+  auto converted = convert_sirius_plan(con, root);
+
+  duckdb_native_ingestible_table_info const* native_info = nullptr;
+  for (auto const& owned_op : converted.inserted_operators) {
+    if (owned_op->type != op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
+    auto const& scan_op = owned_op->Cast<op::scan::sirius_gpu_scan_operator>();
+    native_info =
+      dynamic_cast<duckdb_native_ingestible_table_info const*>(&scan_op.peek_table_info());
+    if (native_info != nullptr) { break; }
+  }
+
+  REQUIRE(native_info != nullptr);
+  REQUIRE(native_info->column_ids.empty());
+  REQUIRE(native_info->projection_ids.empty());
+  REQUIRE(native_info->projected_cols.size() == 1);
+  REQUIRE(native_info->projected_cols[0].is_rowid);
+  REQUIRE(native_info->projected_types.size() == 1);
+  REQUIRE(native_info->projected_types[0].id() == sirius::type_id::BIGINT);
 }
 
 TEST_CASE("S3 ioctx serves DuckDB-native block range shapes byte-identically",

@@ -18,9 +18,13 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <cctype>
+#include <cmath>
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -82,45 +86,106 @@ struct path_exists {
 /// Plain integers without suffix are returned as-is.
 ///
 /// Follows the Kubernetes/systemd convention where K=1000, Ki=1024.
-inline std::uint64_t parse_bytes(std::string_view sv)
+inline std::string_view trim_ascii_whitespace(std::string_view sv)
 {
-  if (sv.empty()) { throw std::runtime_error("empty byte value"); }
+  while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front()))) {
+    sv.remove_prefix(1);
+  }
+  while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.back()))) {
+    sv.remove_suffix(1);
+  }
+  return sv;
+}
 
-  // Find where the numeric part ends
-  size_t pos = 0;
-  while (pos < sv.size() && (std::isdigit(sv[pos]) || sv[pos] == '.' || sv[pos] == '-')) {
+inline std::uint64_t byte_suffix_multiplier(std::string_view suffix)
+{
+  if (suffix.empty()) return 1ULL;
+  if (suffix.size() > 3) return 0ULL;
+
+  auto upper = [](char ch) {
+    return static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  };
+
+  if (suffix.size() == 1 && upper(suffix[0]) == 'B') return 1ULL;
+
+  size_t pos         = 1;
+  auto const unit    = upper(suffix[0]);
+  std::uint64_t base = 1000ULL;
+  if (pos < suffix.size() && upper(suffix[pos]) == 'I') {
+    base = 1024ULL;
     ++pos;
   }
 
-  if (pos == 0) { throw std::runtime_error("invalid byte value: '" + std::string(sv) + "'"); }
+  if (pos < suffix.size() && upper(suffix[pos]) == 'B') { ++pos; }
+  if (pos != suffix.size()) return 0ULL;
 
-  double number = std::stod(std::string(sv.substr(0, pos)));
-  auto suffix   = sv.substr(pos);
-
-  // Strip leading whitespace from suffix
-  while (!suffix.empty() && suffix[0] == ' ') {
-    suffix.remove_prefix(1);
-  }
-
-  if (suffix.empty() || suffix == "B" || suffix == "b") {
-    return static_cast<std::uint64_t>(number);
-  }
-
-  // Determine if binary (Ki, Mi, Gi, Ti, KiB, MiB, GiB, TiB) or decimal (K, KB, M, MB, ...)
-  char unit   = static_cast<char>(std::toupper(static_cast<unsigned char>(suffix[0])));
-  bool binary = (suffix.size() >= 2 && suffix[1] == 'i');
-
-  std::uint64_t base = binary ? 1024ULL : 1000ULL;
-  std::uint64_t multiplier;
   switch (unit) {
-    case 'K': multiplier = base; break;
-    case 'M': multiplier = base * base; break;
-    case 'G': multiplier = base * base * base; break;
-    case 'T': multiplier = base * base * base * base; break;
-    default: throw std::runtime_error("unknown byte suffix: '" + std::string(suffix) + "'");
+    case 'K': return base;
+    case 'M': return base * base;
+    case 'G': return base * base * base;
+    case 'T': return base * base * base * base;
+    default: return 0ULL;
+  }
+}
+
+inline std::uint64_t parse_bytes(std::string_view sv)
+{
+  auto const original = sv;
+  sv                  = trim_ascii_whitespace(sv);
+  if (sv.empty()) { throw std::runtime_error("empty byte value"); }
+
+  size_t pos = 0;
+  if (sv[pos] == '+' || sv[pos] == '-') { ++pos; }
+
+  bool has_digit = false;
+  while (pos < sv.size() && std::isdigit(static_cast<unsigned char>(sv[pos]))) {
+    has_digit = true;
+    ++pos;
   }
 
-  return static_cast<std::uint64_t>(number * static_cast<double>(multiplier));
+  if (pos < sv.size() && sv[pos] == '.') {
+    ++pos;
+    while (pos < sv.size() && std::isdigit(static_cast<unsigned char>(sv[pos]))) {
+      has_digit = true;
+      ++pos;
+    }
+  }
+
+  if (!has_digit || (pos < sv.size() && !std::isalpha(static_cast<unsigned char>(sv[pos])) &&
+                     !std::isspace(static_cast<unsigned char>(sv[pos])))) {
+    throw std::runtime_error("invalid byte value: '" + std::string(original) + "'");
+  }
+
+  auto const numeric = std::string(sv.substr(0, pos));
+  size_t parsed      = 0;
+  double number      = 0;
+  try {
+    number = std::stod(numeric, &parsed);
+  } catch (const std::exception&) {
+    throw std::runtime_error("invalid byte value: '" + std::string(original) + "'");
+  }
+  if (parsed != numeric.size()) {
+    throw std::runtime_error("invalid byte value: '" + std::string(original) + "'");
+  }
+  if (!std::isfinite(number)) {
+    throw std::runtime_error("non-finite byte value: '" + std::string(original) + "'");
+  }
+  if (number < 0) {
+    throw std::runtime_error("negative byte value: '" + std::string(original) + "'");
+  }
+
+  auto const suffix     = trim_ascii_whitespace(sv.substr(pos));
+  auto const multiplier = byte_suffix_multiplier(suffix);
+  if (multiplier == 0) {
+    throw std::runtime_error("unknown byte suffix: '" + std::string(suffix) + "'");
+  }
+
+  auto const bytes     = static_cast<long double>(number) * static_cast<long double>(multiplier);
+  auto const max_bytes = static_cast<long double>(std::numeric_limits<std::uint64_t>::max());
+  if (!std::isfinite(bytes) || bytes >= max_bytes) {
+    throw std::runtime_error("byte value out of range: '" + std::string(original) + "'");
+  }
+  return static_cast<std::uint64_t>(bytes);
 }
 
 // ================ read_yaml — type-dispatched YAML→C++ ================= //
@@ -161,16 +226,30 @@ bytes_value<T> bytes(T& v)
 }
 
 template <std::integral T>
-void read_yaml(const YAML::Node& node, bytes_value<T>& out)
+T checked_byte_cast(std::uint64_t value)
+{
+  if (value > static_cast<std::uint64_t>(std::numeric_limits<T>::max())) {
+    throw std::runtime_error("byte value out of range");
+  }
+  return static_cast<T>(value);
+}
+
+template <std::integral T>
+T read_byte_scalar(const YAML::Node& node)
 {
   try {
-    if constexpr (sizeof(T) > 4)
-      out.ref = static_cast<T>(node.as<long long>());
-    else
-      out.ref = static_cast<T>(node.as<int>());
+    auto const value = node.as<long long>();
+    if (value < 0) { throw std::runtime_error("negative byte value"); }
+    return checked_byte_cast<T>(static_cast<std::uint64_t>(value));
   } catch (const YAML::BadConversion&) {
-    out.ref = static_cast<T>(parse_bytes(node.as<std::string>()));
+    return checked_byte_cast<T>(parse_bytes(node.as<std::string>()));
   }
+}
+
+template <std::integral T>
+void read_yaml(const YAML::Node& node, bytes_value<T>& out)
+{
+  out.ref = read_byte_scalar<T>(node);
 }
 
 /// Wrapper for optional byte values.
@@ -188,16 +267,7 @@ optional_bytes_value<T> bytes(std::optional<T>& v)
 template <std::integral T>
 void read_yaml(const YAML::Node& node, optional_bytes_value<T>& out)
 {
-  T val{};
-  try {
-    if constexpr (sizeof(T) > 4)
-      val = static_cast<T>(node.as<long long>());
-    else
-      val = static_cast<T>(node.as<int>());
-  } catch (const YAML::BadConversion&) {
-    val = static_cast<T>(parse_bytes(node.as<std::string>()));
-  }
-  out.ref = val;
+  out.ref = read_byte_scalar<T>(node);
 }
 
 template <StringEnum T>

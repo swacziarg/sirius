@@ -19,10 +19,12 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <variant>
 
 using namespace sirius;
@@ -100,61 +102,52 @@ TEST_CASE("yaml reader validation with fraction", "[config_opt][conditional]")
 
 TEST_CASE("yaml reader byte suffix parsing", "[config_opt][bytes]")
 {
-  SECTION("plain integers work with bytes()")
-  {
-    auto node          = YAML::Load("size: 1024");
+  auto require_bytes = [](const std::string& yaml_value, std::uint64_t expected) {
+    auto node          = YAML::Load("size: " + yaml_value);
     std::uint64_t size = 0;
     yaml::reader r(node);
     r.optional("size", yaml::bytes(size));
-    REQUIRE(size == 1024);
+    REQUIRE(size == expected);
+  };
+
+  auto require_invalid = [](const std::string& yaml_value) {
+    auto node          = YAML::Load("size: " + yaml_value);
+    std::uint64_t size = 0;
+    yaml::reader r(node);
+    REQUIRE_THROWS_AS(r.optional("size", yaml::bytes(size)), std::runtime_error);
+  };
+
+  SECTION("scalar numbers and quoted byte strings")
+  {
+    require_bytes("1024", 1024);
+    require_bytes("\"1024\"", 1024);
+    require_bytes("\"1024B\"", 1024);
+    require_bytes("512 MiB", 512ULL * 1024 * 1024);
+    require_bytes("\" 512 MiB \"", 512ULL * 1024 * 1024);
   }
 
-  SECTION("binary suffixes (Ki/KiB = 1024)")
+  SECTION("decimal and binary suffixes")
   {
-    auto node       = YAML::Load(R"(a: "4Ki"
-b: "4KiB"
-c: "1GiB"
-d: "2MiB")");
-    std::uint64_t a = 0, b = 0, c = 0, d = 0;
-    yaml::reader r(node);
-    r.optional("a", yaml::bytes(a));
-    r.optional("b", yaml::bytes(b));
-    r.optional("c", yaml::bytes(c));
-    r.optional("d", yaml::bytes(d));
-    REQUIRE(a == 4 * 1024ULL);
-    REQUIRE(b == 4 * 1024ULL);
-    REQUIRE(c == 1ULL * 1024 * 1024 * 1024);
-    REQUIRE(d == 2ULL * 1024 * 1024);
+    require_bytes("1K", 1000ULL);
+    require_bytes("1KB", 1000ULL);
+    require_bytes("1M", 1000ULL * 1000);
+    require_bytes("1Gi", 1024ULL * 1024 * 1024);
+    require_bytes("1GiB", 1024ULL * 1024 * 1024);
+    require_bytes("1TiB", 1024ULL * 1024 * 1024 * 1024);
   }
 
-  SECTION("decimal suffixes (K/KB/G/GB = 1000)")
+  SECTION("case variants are accepted but still fully validated")
   {
-    auto node       = YAML::Load(R"(a: "4K"
-b: "4KB"
-c: "1G"
-d: "1T")");
-    std::uint64_t a = 0, b = 0, c = 0, d = 0;
-    yaml::reader r(node);
-    r.optional("a", yaml::bytes(a));
-    r.optional("b", yaml::bytes(b));
-    r.optional("c", yaml::bytes(c));
-    r.optional("d", yaml::bytes(d));
-    REQUIRE(a == 4000ULL);
-    REQUIRE(b == 4000ULL);
-    REQUIRE(c == 1000ULL * 1000 * 1000);
-    REQUIRE(d == 1000ULL * 1000 * 1000 * 1000);
+    require_bytes("1024b", 1024);
+    require_bytes("1mb", 1000ULL * 1000);
+    require_bytes("1MIB", 1024ULL * 1024);
   }
 
   SECTION("fractional values")
   {
-    auto node        = YAML::Load(R"(si: "1.5G"
-bi: "1.5Gi")");
-    std::uint64_t si = 0, bi = 0;
-    yaml::reader r(node);
-    r.optional("si", yaml::bytes(si));
-    r.optional("bi", yaml::bytes(bi));
-    REQUIRE(si == static_cast<std::uint64_t>(1.5 * 1000 * 1000 * 1000));
-    REQUIRE(bi == static_cast<std::uint64_t>(1.5 * 1024 * 1024 * 1024));
+    require_bytes("1.5G", static_cast<std::uint64_t>(1.5 * 1000 * 1000 * 1000));
+    require_bytes("1.5Gi", static_cast<std::uint64_t>(1.5 * 1024 * 1024 * 1024));
+    require_bytes("\".5MiB\"", 512ULL * 1024);
   }
 
   SECTION("string suffix on plain integer field is rejected")
@@ -165,12 +158,38 @@ bi: "1.5Gi")");
     REQUIRE_THROWS(r.optional("count", count));
   }
 
-  SECTION("invalid suffix throws")
+  SECTION("negative byte values throw")
   {
-    auto node          = YAML::Load(R"(size: "8X")");
     std::uint64_t size = 0;
-    yaml::reader r(node);
-    REQUIRE_THROWS_AS(r.optional("size", size), std::runtime_error);
+
+    auto negative_scalar = YAML::Load("size: -1");
+    yaml::reader scalar_reader(negative_scalar);
+    REQUIRE_THROWS_AS(scalar_reader.optional("size", yaml::bytes(size)), std::runtime_error);
+    REQUIRE(size == 0);
+
+    auto negative_suffix = YAML::Load(R"(size: "-1Gi")");
+    yaml::reader suffix_reader(negative_suffix);
+    REQUIRE_THROWS_AS(suffix_reader.optional("size", yaml::bytes(size)), std::runtime_error);
+    REQUIRE(size == 0);
+  }
+
+  SECTION("invalid suffixes and trailing garbage throw")
+  {
+    require_invalid("8X");
+    require_invalid("1MiBgarbage");
+    require_invalid("1KiBB");
+  }
+
+  SECTION("malformed numeric values throw")
+  {
+    require_invalid("1.2.3Mi");
+    require_invalid("1e3Mi");
+  }
+
+  SECTION("overflow values throw")
+  {
+    require_invalid("18446744073709551616");
+    require_invalid("16777216TiB");
   }
 }
 
